@@ -1,4 +1,4 @@
-module authpkg
+module github.com/Brandon689/authpkg
 
 go 1.24.0
 
