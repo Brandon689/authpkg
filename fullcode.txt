@@ -1,0 +1,1052 @@
+auth\api.go:
+<code>
+// Package auth provides a classic, production-friendly authentication layer
+// for Go web apps using:
+//   - Cookie-based, server-side sessions stored in SQLite
+//   - Password hashing via bcrypt (configurable cost at setup time)
+//   - Minimal, framework-agnostic API and HTTP helpers
+//
+// This file is the public, self-documenting API surface. The internal
+// implementation is split across other files in this package.
+//
+// Quick start:
+//   1) Place this package in: yourmodule/auth
+//   2) go get github.com/mattn/go-sqlite3 golang.org/x/crypto/bcrypt
+//   3) Example usage:
+//
+//       package main
+//
+//       import (
+//         "log"
+//         "net/http"
+//         "time"
+//         "yourmodule/auth"
+//       )
+//
+//       func main() {
+//         httpOnly := true
+//         api, err := auth.New(auth.Config{
+//           DBPath:           "app.db",
+//           SessionName:      "session",
+//           SessionTTL:       24 * time.Hour,
+//           CookieSecure:     false, // true in production (HTTPS)
+//           CookieHTTPOnly:   &httpOnly, // tri-state; default is true if nil
+//           CookieSameSite:   http.SameSiteLaxMode,
+//           BcryptCost:       12,
+//           MinPasswordLength: 8,
+//           RequireStrongPasswords: false, // set true to require letters+digits
+//           PruneInterval:    time.Hour,   // periodically prune expired sessions
+//           MaxOpenConns:     1,           // recommended for SQLite
+//           MaxIdleConns:     1,
+//         })
+//         if err != nil {
+//           log.Fatal(err)
+//         }
+//         defer api.Close()
+//
+//         mux := http.NewServeMux()
+//
+//         // POST /register
+//         mux.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+//           if r.Method != http.MethodPost {
+//             http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+//             return
+//           }
+//           // Basic CSRF hardening: enforce same-origin for state-changing POST
+//           if !auth.SameOrigin(r) {
+//             http.Error(w, "forbidden", http.StatusForbidden)
+//             return
+//           }
+//           email := r.FormValue("email")
+//           password := r.FormValue("password")
+//           _, err := api.Register(r.Context(), email, password)
+//           if err != nil {
+//             // Do not leak internal errors; log if needed
+//             http.Error(w, "invalid input", http.StatusBadRequest)
+//             return
+//           }
+//           w.WriteHeader(http.StatusCreated)
+//           _, _ = w.Write([]byte("registered"))
+//         })
+//
+//         // POST /login
+//         mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+//           if r.Method != http.MethodPost {
+//             http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+//             return
+//           }
+//           if !auth.SameOrigin(r) {
+//             http.Error(w, "forbidden", http.StatusForbidden)
+//             return
+//           }
+//           email := r.FormValue("email")
+//           password := r.FormValue("password")
+//           _, err := api.Login(w, r, email, password)
+//           if err != nil {
+//             http.Error(w, "invalid credentials", http.StatusUnauthorized)
+//             return
+//           }
+//           _, _ = w.Write([]byte("logged in"))
+//         })
+//
+//         // GET /me (requires session middleware)
+//         mux.Handle("/me", api.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//           user, ok := auth.FromContext(r.Context())
+//           if !ok {
+//             http.Error(w, "unauthenticated", http.StatusUnauthorized)
+//             return
+//           }
+//           _, _ = w.Write([]byte("hello " + user.Email))
+//         })))
+//
+//         // POST /logout (method-locked and same-origin check)
+//         mux.HandleFunc("/logout", func(w http.ResponseWriter, r *http.Request) {
+//           if r.Method != http.MethodPost {
+//             http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+//             return
+//           }
+//           if !auth.SameOrigin(r) {
+//             http.Error(w, "forbidden", http.StatusForbidden)
+//             return
+//           }
+//           if err := api.Logout(w, r); err != nil {
+//             http.Error(w, "internal error", http.StatusInternalServerError)
+//             return
+//           }
+//           _, _ = w.Write([]byte("logged out"))
+//         })
+//
+//         log.Println("listening on :8080")
+//         log.Fatal(http.ListenAndServe(":8080", mux))
+//       }
+//
+// Security notes:
+//   - Set CookieSecure=true in production (HTTPS).
+//   - Choose an appropriate BcryptCost (10–14 typical). Higher cost => more CPU.
+//   - Session tokens are random 32-byte values, stored server-side.
+//   - Sessions expire after SessionTTL and are refreshed in Middleware.
+//   - Basic CSRF hardening in example: POST-only and same-origin checks.
+//
+// Driver note:
+//   - Uses github.com/mattn/go-sqlite3 (cgo). To use a pure-Go driver, replace
+//     the side-effect import in store_sqlite_driver.go with modernc.org/sqlite.
+//
+// API overview:
+//   - type Config
+//   - type API
+//   - type User
+//   - func New(Config) (*API, error)
+//   - func (*API) Close() error
+//   - func (*API) Register(ctx, email, password) (User, error)
+//   - func (*API) Login(w, r, email, password) (User, error)
+//   - func (*API) Logout(w, r) error
+//   - func (*API) CurrentUser(w, r) (User, bool, error)
+//   - func (*API) Middleware(next http.Handler) http.Handler
+//   - func (*API) RequireAuth(next http.Handler) http.Handler
+//   - func FromContext(ctx) (User, bool)
+//   - func (*API) PruneExpiredSessions(ctx) error
+//   - func (*API) RevokeAllSessions(ctx, userID) error
+//   - func (*API) ChangePassword(ctx, userID, newPassword) error
+package auth
+
+import (
+  "context"
+  "net/http"
+  "time"
+  "sync"
+)
+
+// Config controls the behavior of the auth package.
+// All fields are optional; defaults are applied in New.
+type Config struct {
+ // DBPath is the filename for the SQLite database. Example: "app.db"
+ DBPath string
+
+ // SessionName is the cookie name for the session token. Default: "session".
+ SessionName string
+
+ // SessionTTL controls session lifetime. Default: 24h.
+ SessionTTL time.Duration
+
+ // CookieDomain sets the cookie domain (empty => host-only).
+ CookieDomain string
+
+ // CookieSecure should be true in production (HTTPS). Default: false.
+ CookieSecure bool
+
+ // CookieHTTPOnly controls HttpOnly on the cookie. Default: true if nil.
+ // Tri-state: nil => default true; &true or &false to force.
+ CookieHTTPOnly *bool
+
+ // CookieSameSite controls the SameSite attribute. Default: http.SameSiteLaxMode.
+ CookieSameSite http.SameSite
+
+ // BcryptCost controls password hashing difficulty (4..31). Typical: 10–14.
+ // Default: bcrypt.DefaultCost. Setup-only: must be provided in Config.
+ BcryptCost int
+
+ // Password policy (optional).
+ // Default MinPasswordLength=8, RequireStrongPasswords=false.
+ MinPasswordLength     int
+ RequireStrongPasswords bool
+
+ // Now allows overriding the time source (useful in tests). Default: time.Now.
+ Now func() time.Time
+
+ // Session maintenance: periodically prune expired sessions if > 0. Default: 1h.
+ PruneInterval time.Duration
+
+ // SQLite pool tuning. Defaults suitable for SQLite: 1/1.
+ MaxOpenConns int
+ MaxIdleConns int
+
+ // Logf is an optional logger hook (printf-style). If nil, logging is disabled.
+ Logf func(format string, args ...any)
+}
+
+// API is the main entry point for authentication operations.
+// It is safe to share a single instance across handlers.
+type API struct {
+  db     dbHandle
+  cfg    Config
+  stopCh chan struct{}
+  wg     sync.WaitGroup
+}
+
+// User is a minimal representation returned by the API (no password fields).
+type User struct {
+ ID        int64
+ Email     string
+ CreatedAt time.Time
+}
+
+// New initializes the SQLite database, runs migrations, and returns an API.
+func New(cfg Config) (*API, error) {
+ return newAPI(cfg)
+}
+
+// Close releases underlying resources (e.g., DB connections) and stops background jobs.
+func (a *API) Close() error {
+ return a.closeInternal()
+}
+
+// Register creates a new user with a bcrypt-hashed password.
+// - Email is normalized to lower-case and trimmed.
+// - Password must meet configured policy (min length, optional strength).
+// Returns the created User (without password).
+func (a *API) Register(ctx context.Context, email, password string) (User, error) {
+ return a.registerInternal(ctx, email, password)
+}
+
+// Login verifies credentials, creates a server-side session, and sets a secure cookie.
+// Returns the authenticated User on success. The cookie contains an opaque token;
+// session state (user, expiry) is stored in SQLite.
+func (a *API) Login(w http.ResponseWriter, r *http.Request, email, password string) (User, error) {
+ return a.loginInternal(w, r, email, password)
+}
+
+// Logout removes the current session (if any) and clears the cookie.
+func (a *API) Logout(w http.ResponseWriter, r *http.Request) error {
+ return a.logoutInternal(w, r)
+}
+
+// CurrentUser resolves the session from the request cookie and returns:
+//   - User: the associated user
+//   - ok: whether a valid session was found
+//   - err: unexpected errors (db, etc.)
+func (a *API) CurrentUser(w http.ResponseWriter, r *http.Request) (User, bool, error) {
+ return a.currentUserInternal(w, r)
+}
+
+// Middleware resolves the current user (if any) and injects it into the request context.
+// It also refreshes sessions close to expiry.
+func (a *API) Middleware(next http.Handler) http.Handler {
+ return a.middlewareInternal(next)
+}
+
+// RequireAuth ensures a valid user is present in context (e.g., after Middleware).
+// If not authenticated, it returns 401 and stops the chain.
+func (a *API) RequireAuth(next http.Handler) http.Handler {
+ return a.requireAuthInternal(next)
+}
+
+// FromContext retrieves the current user injected by Middleware.
+func FromContext(ctx context.Context) (User, bool) {
+ return fromContext(ctx)
+}
+
+// PruneExpiredSessions deletes expired sessions immediately.
+func (a *API) PruneExpiredSessions(ctx context.Context) error {
+ return a.pruneExpiredSessionsInternal(ctx)
+}
+
+// RevokeAllSessions deletes all sessions for the given user (e.g., after password change).
+func (a *API) RevokeAllSessions(ctx context.Context, userID int64) error {
+ return a.revokeAllSessionsInternal(ctx, userID)
+}
+
+// ChangePassword updates the user's password hash and revokes all their sessions.
+func (a *API) ChangePassword(ctx context.Context, userID int64, newPassword string) error {
+ return a.changePasswordInternal(ctx, userID, newPassword)
+}
+</code>
+
+auth\auth.go:
+<code>
+package auth
+
+import (
+  "context"
+  "database/sql"
+  "errors"
+  "fmt"
+  "net/http"
+  "strings"
+  "time"
+  "golang.org/x/crypto/bcrypt"
+)
+
+const failedLoginDelay = 250 * time.Millisecond
+
+func (a *API) registerInternal(ctx context.Context, email, password string) (User, error) {
+ email = normalizeEmail(email)
+ if !validEmailBasic(email) {
+  return User{}, fmt.Errorf("invalid email")
+ }
+
+ if err := validatePasswordPolicy(password, a.cfg.MinPasswordLength, a.cfg.RequireStrongPasswords); err != nil {
+  return User{}, err
+ }
+
+ cost := a.cfg.BcryptCost
+ hash, err := bcrypt.GenerateFromPassword([]byte(password), cost)
+ if err != nil {
+  return User{}, fmt.Errorf("hash password: %w", err)
+ }
+
+ now := a.now().Unix()
+ tx, err := a.db.BeginTx(ctx, nil)
+ if err != nil {
+  return User{}, fmt.Errorf("begin: %w", err)
+ }
+ defer rollbackIfNeeded(tx)
+
+ res, err := tx.ExecContext(ctx, `
+  INSERT INTO users (email, password_hash, created_at)
+  VALUES (?, ?, ?)
+ `, email, hash, now)
+ if err != nil {
+  // Be driver-agnostic: detect unique violations by message.
+  msg := strings.ToLower(err.Error())
+  if strings.Contains(msg, "unique") && strings.Contains(msg, "users") && strings.Contains(msg, "email") {
+   return User{}, fmt.Errorf("email already registered")
+  }
+  return User{}, fmt.Errorf("insert user: %w", err)
+ }
+
+ id, err := res.LastInsertId()
+ if err != nil {
+  return User{}, fmt.Errorf("last insert id: %w", err)
+ }
+ if err := tx.Commit(); err != nil {
+  return User{}, fmt.Errorf("commit: %w", err)
+ }
+ return User{ID: id, Email: email, CreatedAt: time.Unix(now, 0)}, nil
+}
+
+func (a *API) loginInternal(w http.ResponseWriter, r *http.Request, email, password string) (User, error) {
+  ctx := r.Context()
+  email = normalizeEmail(email)
+  var (
+    id        int64
+    dbEmail   string
+    hash      []byte
+    createdAt int64
+  )
+  err := a.db.QueryRowContext(ctx, `
+    SELECT id, email, password_hash, created_at
+    FROM users
+    WHERE email = ?
+  `, email).Scan(&id, &dbEmail, &hash, &createdAt)
+  if err != nil {
+    if errors.Is(err, sql.ErrNoRows) {
+      time.Sleep(failedLoginDelay)
+      return User{}, fmt.Errorf("invalid credentials")
+    }
+    return User{}, fmt.Errorf("query user: %w", err)
+  }
+  if err := bcrypt.CompareHashAndPassword(hash, []byte(password)); err != nil {
+    time.Sleep(failedLoginDelay)
+    return User{}, fmt.Errorf("invalid credentials")
+  }
+
+  // Opportunistic bcrypt upgrade
+  if currentCost, err := bcrypt.Cost(hash); err == nil && currentCost < a.cfg.BcryptCost {
+    if err := validateBcryptCost(a.cfg.BcryptCost); err == nil {
+      if newHash, err := bcrypt.GenerateFromPassword([]byte(password), a.cfg.BcryptCost); err == nil {
+        if _, err := a.db.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, newHash, id); err != nil {
+          a.logf("bcrypt upgrade failed for user %d: %v", id, err)
+        }
+      } else {
+        a.logf("bcrypt rehash error: %v", err)
+      }
+    }
+  }
+
+  user := User{ID: id, Email: dbEmail, CreatedAt: time.Unix(createdAt, 0)}
+  if err := a.createSessionAndSetCookie(w, ctx, user.ID); err != nil {
+    return User{}, fmt.Errorf("create session: %w", err)
+  }
+  return user, nil
+}
+
+func (a *API) logoutInternal(w http.ResponseWriter, r *http.Request) error {
+ token, err := a.readSessionCookie(r)
+ if err != nil || token == "" {
+  a.clearCookie(w)
+  return nil
+ }
+ if _, err := a.db.ExecContext(r.Context(), `DELETE FROM sessions WHERE token = ?`, token); err != nil {
+  a.clearCookie(w)
+  return fmt.Errorf("delete session: %w", err)
+ }
+ a.clearCookie(w)
+ return nil
+}
+
+func (a *API) currentUserInternal(w http.ResponseWriter, r *http.Request) (User, bool, error) {
+ ctx := r.Context()
+ token, err := a.readSessionCookie(r)
+ if err != nil || token == "" {
+  return User{}, false, nil
+ }
+ var (
+  userID    int64
+  email     string
+  uc        int64
+  expiresAt int64
+ )
+ err = a.db.QueryRowContext(ctx, `
+  SELECT u.id, u.email, u.created_at, s.expires_at
+  FROM sessions s
+  JOIN users u ON u.id = s.user_id
+  WHERE s.token = ?
+ `, token).Scan(&userID, &email, &uc, &expiresAt)
+ if err != nil {
+  if errors.Is(err, sql.ErrNoRows) {
+   a.clearCookie(w)
+   return User{}, false, nil
+  }
+  return User{}, false, fmt.Errorf("query session: %w", err)
+ }
+ now := a.now().Unix()
+ if now >= expiresAt {
+  _, _ = a.db.ExecContext(ctx, `DELETE FROM sessions WHERE token = ?`, token)
+  a.clearCookie(w)
+  return User{}, false, nil
+ }
+ // Refresh if within last 20% of TTL.
+ ttl := int64(a.cfg.SessionTTL.Seconds())
+ if ttl > 0 {
+  remaining := expiresAt - now
+  if remaining*5 <= ttl {
+   newExp := now + ttl
+   if _, err := a.db.ExecContext(ctx, `UPDATE sessions SET expires_at = ? WHERE token = ?`, newExp, token); err == nil {
+    a.setCookie(w, token, time.Unix(newExp, 0))
+   }
+  }
+ }
+ return User{ID: userID, Email: email, CreatedAt: time.Unix(uc, 0)}, true, nil
+}
+
+func (a *API) pruneExpiredSessionsInternal(ctx context.Context) error {
+ _, err := a.db.ExecContext(ctx, `DELETE FROM sessions WHERE expires_at <= ?`, a.now().Unix())
+ return err
+}
+
+func (a *API) revokeAllSessionsInternal(ctx context.Context, userID int64) error {
+ _, err := a.db.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID)
+ return err
+}
+
+func (a *API) changePasswordInternal(ctx context.Context, userID int64, newPassword string) error {
+ if err := validatePasswordPolicy(newPassword, a.cfg.MinPasswordLength, a.cfg.RequireStrongPasswords); err != nil {
+  return err
+ }
+ hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), a.cfg.BcryptCost)
+ if err != nil {
+  return fmt.Errorf("hash password: %w", err)
+ }
+ tx, err := a.db.BeginTx(ctx, nil)
+ if err != nil {
+  return fmt.Errorf("begin: %w", err)
+ }
+ defer rollbackIfNeeded(tx)
+ if _, err := tx.ExecContext(ctx, `UPDATE users SET password_hash = ? WHERE id = ?`, hash, userID); err != nil {
+  return fmt.Errorf("update user: %w", err)
+ }
+ if _, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE user_id = ?`, userID); err != nil {
+  return fmt.Errorf("revoke sessions: %w", err)
+ }
+ if err := tx.Commit(); err != nil {
+  return fmt.Errorf("commit: %w", err)
+ }
+ return nil
+}
+</code>
+
+auth\config.go:
+<code>
+package auth
+
+import (
+ "fmt"
+ "net/http"
+ "time"
+
+ "golang.org/x/crypto/bcrypt"
+)
+
+func applyDefaults(cfg *Config) {
+ if cfg.DBPath == "" {
+  cfg.DBPath = "auth.db"
+ }
+ if cfg.SessionName == "" {
+  cfg.SessionName = "session"
+ }
+ if cfg.SessionTTL <= 0 {
+  cfg.SessionTTL = 24 * time.Hour
+ }
+ if cfg.CookieSameSite == 0 {
+  cfg.CookieSameSite = http.SameSiteLaxMode
+ }
+ if cfg.CookieHTTPOnly == nil {
+  t := true
+  cfg.CookieHTTPOnly = &t
+ }
+ if cfg.BcryptCost == 0 {
+  cfg.BcryptCost = bcrypt.DefaultCost
+ }
+ if cfg.MinPasswordLength <= 0 {
+  cfg.MinPasswordLength = 8
+ }
+ // RequireStrongPasswords defaults to false; leave as-is.
+
+ if cfg.PruneInterval <= 0 {
+  cfg.PruneInterval = time.Hour
+ }
+ if cfg.MaxOpenConns <= 0 {
+  cfg.MaxOpenConns = 1
+ }
+ if cfg.MaxIdleConns <= 0 {
+  cfg.MaxIdleConns = 1
+ }
+}
+
+func validateBcryptCost(cost int) error {
+ if cost < 4 || cost > 31 {
+  return fmt.Errorf("bcrypt cost must be in [4,31]; got %d", cost)
+ }
+ return nil
+}
+</code>
+
+auth\config_test.go:
+<code>
+package auth
+
+import (
+  "net/http"
+  "testing"
+  "time"
+
+  "golang.org/x/crypto/bcrypt"
+)
+
+func TestDefaultsApplied(t *testing.T) {
+  api, cleanup := newTestAPI(t, func(c *Config) {
+    // Intentionally leave most fields zero-valued except DBPath from helper
+    c.SessionName = ""
+    c.SessionTTL = 0
+    c.CookieSameSite = 0
+    c.BcryptCost = 0
+    // Do not set CookieHTTPOnly; leaving it nil should default to true
+  })
+  defer cleanup()
+
+  if api.cfg.SessionName != "session" {
+    t.Fatalf("SessionName default: got %q", api.cfg.SessionName)
+  }
+  if api.cfg.SessionTTL != 24*time.Hour {
+    t.Fatalf("SessionTTL default: got %v", api.cfg.SessionTTL)
+  }
+  if api.cfg.CookieSameSite != http.SameSiteLaxMode {
+    t.Fatalf("CookieSameSite default: got %v", api.cfg.CookieSameSite)
+  }
+  if api.cfg.CookieHTTPOnly == nil || !*api.cfg.CookieHTTPOnly {
+    t.Fatalf("CookieHTTPOnly default: got %v", api.cfg.CookieHTTPOnly)
+  }
+  if api.cfg.BcryptCost != bcrypt.DefaultCost {
+    t.Fatalf("BcryptCost default: got %v", api.cfg.BcryptCost)
+  }
+}
+
+func TestSetBcryptCostValidation(t *testing.T) {
+  api, cleanup := newTestAPI(t)
+  defer cleanup()
+
+  if err := api.SetBcryptCost(3); err == nil {
+    t.Fatalf("expected error for cost 3")
+  }
+  if err := api.SetBcryptCost(32); err == nil {
+    t.Fatalf("expected error for cost 32")
+  }
+  if err := api.SetBcryptCost(5); err != nil {
+    t.Fatalf("unexpected error: %v", err)
+  }
+}
+
+</code>
+
+auth\context.go:
+<code>
+package auth
+
+import (
+ "context"
+)
+
+type ctxKey string
+
+var ctxUserKey ctxKey = "auth.user"
+
+func fromContext(ctx context.Context) (User, bool) {
+ u, ok := ctx.Value(ctxUserKey).(User)
+ return u, ok
+}
+
+func withUser(ctx context.Context, u User) context.Context {
+ return context.WithValue(ctx, ctxUserKey, u)
+}
+</code>
+
+auth\middleware.go:
+<code>
+package auth
+
+import (
+  "net/http"
+)
+
+func (a *API) middlewareInternal(next http.Handler) http.Handler {
+  return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+    user, ok, err := a.currentUserInternal(w, r)
+    if err != nil {
+      a.logf("currentUser error: %v", err)
+      http.Error(w, "internal error", http.StatusInternalServerError)
+      return
+    }
+    if ok {
+      next.ServeHTTP(w, r.WithContext(withUser(r.Context(), user)))
+      return
+    }
+    next.ServeHTTP(w, r)
+  })
+}
+
+func (a *API) requireAuthInternal(next http.Handler) http.Handler {
+ return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+  if _, ok := fromContext(r.Context()); !ok {
+   http.Error(w, "unauthorized", http.StatusUnauthorized)
+   return
+  }
+  next.ServeHTTP(w, r)
+ })
+}
+</code>
+
+auth\migrate.go:
+<code>
+package auth
+
+import "fmt"
+
+func (a *API) migrate() error {
+  tx, err := a.db.Begin()
+  if err != nil {
+    return fmt.Errorf("migrate begin: %w", err)
+  }
+  defer rollbackIfNeeded(tx)
+
+  stmts := []string{
+    `CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT NOT NULL UNIQUE,
+      password_hash BLOB NOT NULL,
+      created_at INTEGER NOT NULL
+    );`,
+    `CREATE TABLE IF NOT EXISTS sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      token TEXT NOT NULL UNIQUE,
+      user_id INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );`,
+    `CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);`,
+  }
+
+  for _, s := range stmts {
+    if _, err := tx.Exec(s); err != nil {
+      return fmt.Errorf("migrate step: %w", err)
+    }
+  }
+  if err := tx.Commit(); err != nil {
+    return fmt.Errorf("migrate commit: %w", err)
+  }
+  return nil
+}
+
+</code>
+
+auth\sessions.go:
+<code>
+package auth
+
+import (
+  "context"
+  "crypto/rand"
+  "database/sql"
+  "encoding/base64"
+  "errors"
+  "net/http"
+  "time"
+  "strings"
+  "fmt"
+)
+
+func (a *API) createSessionAndSetCookie(w http.ResponseWriter, ctx context.Context, userID int64) error {
+  now := a.now()
+  expiresAt := now.Add(a.cfg.SessionTTL).Unix()
+
+  for attempts := 0; attempts < 3; attempts++ {
+    token, err := newSessionToken()
+    if err != nil {
+      return err
+    }
+    _, err = a.db.ExecContext(ctx, `
+      INSERT INTO sessions (token, user_id, expires_at, created_at)
+      VALUES (?, ?, ?, ?)
+    `, token, userID, expiresAt, now.Unix())
+    if err != nil {
+      msg := strings.ToLower(err.Error())
+      if strings.Contains(msg, "unique") && strings.Contains(msg, "sessions") && strings.Contains(msg, "token") {
+        continue // retry on unlikely collision
+      }
+      return err
+    }
+    a.setCookie(w, token, time.Unix(expiresAt, 0))
+    return nil
+  }
+  return fmt.Errorf("could not create unique session token after retries")
+}
+
+func (a *API) readSessionCookie(r *http.Request) (string, error) {
+ c, err := r.Cookie(a.cfg.SessionName)
+ if err != nil {
+  if errors.Is(err, http.ErrNoCookie) {
+   return "", nil
+  }
+  return "", err
+ }
+ return c.Value, nil
+}
+
+// setCookie computes MaxAge using the package's time source to keep tests deterministic.
+func (a *API) setCookie(w http.ResponseWriter, token string, expires time.Time) {
+ // Compute delta relative to a.now(), not time.Now(), so tests with fixed Now pass.
+ delta := int(expires.Sub(a.now()).Seconds())
+ if delta <= 0 {
+  // Fallback to configured TTL seconds if clock skew or rounding produced non-positive.
+  delta = int(a.cfg.SessionTTL.Seconds())
+  if delta <= 0 {
+   delta = 1
+  }
+ }
+ httpOnly := true
+ if a.cfg.CookieHTTPOnly != nil {
+  httpOnly = *a.cfg.CookieHTTPOnly
+ }
+ c := &http.Cookie{
+  Name:     a.cfg.SessionName,
+  Value:    token,
+  Path:     "/",
+  Domain:   a.cfg.CookieDomain,
+  Expires:  expires,
+  MaxAge:   delta,
+  HttpOnly: httpOnly,
+  Secure:   a.cfg.CookieSecure,
+  SameSite: a.cfg.CookieSameSite,
+ }
+ http.SetCookie(w, c)
+}
+
+// clearCookie uses MaxAge=0 plus an Expires in the past to ensure deletion across clients.
+func (a *API) clearCookie(w http.ResponseWriter) {
+ httpOnly := true
+ if a.cfg.CookieHTTPOnly != nil {
+  httpOnly = *a.cfg.CookieHTTPOnly
+ }
+ c := &http.Cookie{
+  Name:     a.cfg.SessionName,
+  Value:    "",
+  Path:     "/",
+  Domain:   a.cfg.CookieDomain,
+  Expires:  time.Unix(0, 0),
+  MaxAge:   0,
+  HttpOnly: httpOnly,
+  Secure:   a.cfg.CookieSecure,
+  SameSite: a.cfg.CookieSameSite,
+ }
+ http.SetCookie(w, c)
+}
+
+func newSessionToken() (string, error) {
+ var b [32]byte
+ if _, err := rand.Read(b[:]); err != nil {
+  return "", err
+ }
+ return base64.RawURLEncoding.EncodeToString(b[:]), nil
+}
+
+// rollbackIfNeeded rolls back tx if it's still active.
+func rollbackIfNeeded(tx *sql.Tx) {
+ _ = tx.Rollback()
+}
+</code>
+
+auth\store.go:
+<code>
+package auth
+
+import (
+  "context"
+  "database/sql"
+  "fmt"
+  "time"
+)
+
+// dbHandle abstracts *sql.DB for testability and context-aware calls.
+type dbHandle interface {
+ Close() error
+ Exec(query string, args ...any) (sql.Result, error)
+ ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+ QueryRow(query string, args ...any) *sql.Row
+ QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+ Begin() (*sql.Tx, error)
+ BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error)
+}
+
+// sqliteDB is the concrete DB handle in production (embeds *sql.DB).
+type sqliteDB struct{ *sql.DB }
+
+func (s *sqliteDB) Begin() (*sql.Tx, error) { return s.DB.Begin() }
+func (s *sqliteDB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+ return s.DB.BeginTx(ctx, opts)
+}
+
+// New constructs the API and initializes the database.
+func newAPI(cfg Config) (*API, error) {
+ applyDefaults(&cfg)
+ if err := validateBcryptCost(cfg.BcryptCost); err != nil {
+  return nil, err
+ }
+
+ db, err := sql.Open("sqlite3", cfg.DBPath+"?_foreign_keys=on&_busy_timeout=5000")
+ if err != nil {
+  return nil, fmt.Errorf("open sqlite: %w", err)
+ }
+ // Recommended SQLite pragmas and pool tuning.
+ if _, err := db.Exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;`); err != nil {
+  _ = db.Close()
+  return nil, fmt.Errorf("set pragmas: %w", err)
+ }
+ db.SetMaxOpenConns(cfg.MaxOpenConns)
+ db.SetMaxIdleConns(cfg.MaxIdleConns)
+
+ api := &API{db: &sqliteDB{DB: db}, cfg: cfg, stopCh: make(chan struct{})}
+ if err := api.migrate(); err != nil {
+  _ = db.Close()
+  return nil, fmt.Errorf("migrate: %w", err)
+ }
+
+ // Background session janitor.
+ if cfg.PruneInterval > 0 {
+  startJanitor(api, cfg.PruneInterval)
+ }
+
+ return api, nil
+}
+
+func (a *API) closeInternal() error {
+  if a.db == nil {
+    return nil
+  }
+  if a.stopCh != nil {
+    close(a.stopCh)
+  }
+  a.wg.Wait()
+  return a.db.Close()
+}
+
+func startJanitor(a *API, interval time.Duration) {
+  ticker := time.NewTicker(interval)
+  a.wg.Add(1)
+  go func() {
+    defer a.wg.Done()
+    defer ticker.Stop()
+    for {
+      select {
+      case <-ticker.C:
+        if err := a.pruneExpiredSessionsInternal(context.Background()); err != nil {
+          a.logf("janitor prune error: %v", err)
+        }
+      case <-a.stopCh:
+        return
+      }
+    }
+  }()
+}
+</code>
+
+auth\store_sqlite_driver.go:
+<code>
+package auth
+
+import _ "github.com/mattn/go-sqlite3" // SQLite driver (cgo). Replace with modernc.org/sqlite if needed.
+</code>
+
+auth\util.go:
+<code>
+package auth
+
+import (
+  "net/url"
+  "strings"
+  "time"
+  "fmt"
+  "net/http"
+)
+
+func (a *API) now() time.Time {
+ if a.cfg.Now != nil {
+  return a.cfg.Now()
+ }
+ return time.Now()
+}
+
+func normalizeEmail(e string) string {
+ return strings.TrimSpace(strings.ToLower(e))
+}
+
+func validEmailBasic(e string) bool {
+ // Minimal sanity check without full RFC validation.
+ if e == "" || !strings.Contains(e, "@") {
+  return false
+ }
+ parts := strings.Split(e, "@")
+ if len(parts) != 2 {
+  return false
+ }
+ if parts[0] == "" || parts[1] == "" || !strings.Contains(parts[1], ".") {
+  return false
+ }
+ return true
+}
+
+// validatePasswordPolicy enforces minimal length and optional strength requirements.
+func validatePasswordPolicy(pw string, minLen int, requireStrong bool) error {
+ if len(pw) < minLen {
+  return fmt.Errorf("password too short (min %d)", minLen)
+ }
+ if requireStrong && !hasLetterAndDigit(pw) {
+  return fmt.Errorf("password must contain at least one letter and one digit")
+ }
+ return nil
+}
+
+func hasLetterAndDigit(s string) bool {
+ var hasL, hasD bool
+ for _, r := range s {
+  switch {
+  case r >= '0' && r <= '9':
+   hasD = true
+  case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z'):
+   hasL = true
+  }
+  if hasL && hasD {
+   return true
+  }
+ }
+ return false
+}
+
+// SameOrigin performs a basic same-origin check using the Origin header.
+// If Origin is absent (e.g., non-CORS same-site requests), it returns true.
+// It compares the Host in Origin with r.Host (scheme is ignored).
+func SameOrigin(r *http.Request) bool {
+  origin := r.Header.Get("Origin")
+  if origin != "" {
+    u, err := url.Parse(origin)
+    if err != nil {
+      return false
+    }
+    return strings.EqualFold(u.Host, r.Host)
+  }
+  // Fallback to Referer for unsafe methods.
+  if isUnsafeMethod(r.Method) {
+    ref := r.Header.Get("Referer")
+    if ref == "" {
+      return false
+    }
+    u, err := url.Parse(ref)
+    if err != nil {
+      return false
+    }
+    return strings.EqualFold(u.Host, r.Host)
+  }
+  // Allow safe methods when Origin is absent.
+  return true
+}
+
+func isUnsafeMethod(m string) bool {
+  switch m {
+  case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+    return true
+  default:
+    return false
+  }
+}
+
+func (a *API) logf(format string, args ...any) {
+  if a != nil && a.cfg.Logf != nil {
+    a.cfg.Logf(format, args...)
+  }
+}
+</code>
+
+go.mod:
+<code>
+module github.com/Brandon689/authpkg
+
+go 1.24.0
+
+toolchain go1.24.7
+
+require (
+	github.com/mattn/go-sqlite3 v1.14.32
+	golang.org/x/crypto v0.42.0
+)
+
+</code>
+

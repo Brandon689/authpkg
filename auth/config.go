@@ -21,12 +21,26 @@ func applyDefaults(cfg *Config) {
  if cfg.CookieSameSite == 0 {
   cfg.CookieSameSite = http.SameSiteLaxMode
  }
- // Default HttpOnly to true if caller didn't explicitly set it.
- if !cfg.CookieHTTPOnly {
-  cfg.CookieHTTPOnly = true
+ if cfg.CookieHTTPOnly == nil {
+  t := true
+  cfg.CookieHTTPOnly = &t
  }
  if cfg.BcryptCost == 0 {
   cfg.BcryptCost = bcrypt.DefaultCost
+ }
+ if cfg.MinPasswordLength <= 0 {
+  cfg.MinPasswordLength = 8
+ }
+ // RequireStrongPasswords defaults to false; leave as-is.
+
+ if cfg.PruneInterval <= 0 {
+  cfg.PruneInterval = time.Hour
+ }
+ if cfg.MaxOpenConns <= 0 {
+  cfg.MaxOpenConns = 1
+ }
+ if cfg.MaxIdleConns <= 0 {
+  cfg.MaxIdleConns = 1
  }
 }
 

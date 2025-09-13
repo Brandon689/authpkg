@@ -1,32 +1,41 @@
 package auth
 
 import (
- "context"
- "crypto/rand"
- "database/sql"
- "encoding/base64"
- "errors"
- "net/http"
- "time"
+  "context"
+  "crypto/rand"
+  "database/sql"
+  "encoding/base64"
+  "errors"
+  "net/http"
+  "time"
+  "strings"
+  "fmt"
 )
 
 func (a *API) createSessionAndSetCookie(w http.ResponseWriter, ctx context.Context, userID int64) error {
- token, err := newSessionToken()
- if err != nil {
-  return err
- }
- now := a.now()
- expiresAt := now.Add(a.cfg.SessionTTL).Unix()
+  now := a.now()
+  expiresAt := now.Add(a.cfg.SessionTTL).Unix()
 
- if _, err := a.db.ExecContext(ctx, `
-  INSERT INTO sessions (token, user_id, expires_at, created_at)
-  VALUES (?, ?, ?, ?)
- `, token, userID, expiresAt, now.Unix()); err != nil {
-  return err
- }
-
- a.setCookie(w, token, time.Unix(expiresAt, 0))
- return nil
+  for attempts := 0; attempts < 3; attempts++ {
+    token, err := newSessionToken()
+    if err != nil {
+      return err
+    }
+    _, err = a.db.ExecContext(ctx, `
+      INSERT INTO sessions (token, user_id, expires_at, created_at)
+      VALUES (?, ?, ?, ?)
+    `, token, userID, expiresAt, now.Unix())
+    if err != nil {
+      msg := strings.ToLower(err.Error())
+      if strings.Contains(msg, "unique") && strings.Contains(msg, "sessions") && strings.Contains(msg, "token") {
+        continue // retry on unlikely collision
+      }
+      return err
+    }
+    a.setCookie(w, token, time.Unix(expiresAt, 0))
+    return nil
+  }
+  return fmt.Errorf("could not create unique session token after retries")
 }
 
 func (a *API) readSessionCookie(r *http.Request) (string, error) {
@@ -51,6 +60,10 @@ func (a *API) setCookie(w http.ResponseWriter, token string, expires time.Time) 
    delta = 1
   }
  }
+ httpOnly := true
+ if a.cfg.CookieHTTPOnly != nil {
+  httpOnly = *a.cfg.CookieHTTPOnly
+ }
  c := &http.Cookie{
   Name:     a.cfg.SessionName,
   Value:    token,
@@ -58,7 +71,7 @@ func (a *API) setCookie(w http.ResponseWriter, token string, expires time.Time) 
   Domain:   a.cfg.CookieDomain,
   Expires:  expires,
   MaxAge:   delta,
-  HttpOnly: a.cfg.CookieHTTPOnly,
+  HttpOnly: httpOnly,
   Secure:   a.cfg.CookieSecure,
   SameSite: a.cfg.CookieSameSite,
  }
@@ -67,6 +80,10 @@ func (a *API) setCookie(w http.ResponseWriter, token string, expires time.Time) 
 
 // clearCookie uses MaxAge=0 plus an Expires in the past to ensure deletion across clients.
 func (a *API) clearCookie(w http.ResponseWriter) {
+ httpOnly := true
+ if a.cfg.CookieHTTPOnly != nil {
+  httpOnly = *a.cfg.CookieHTTPOnly
+ }
  c := &http.Cookie{
   Name:     a.cfg.SessionName,
   Value:    "",
@@ -74,7 +91,7 @@ func (a *API) clearCookie(w http.ResponseWriter) {
   Domain:   a.cfg.CookieDomain,
   Expires:  time.Unix(0, 0),
   MaxAge:   0,
-  HttpOnly: a.cfg.CookieHTTPOnly,
+  HttpOnly: httpOnly,
   Secure:   a.cfg.CookieSecure,
   SameSite: a.cfg.CookieSameSite,
  }

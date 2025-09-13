@@ -8,12 +8,13 @@ import (
 )
 
 func TestCookieFlagsOnLoginAndClear(t *testing.T) {
- api, cleanup := newTestAPI(t, func(c *Config) {
-  c.CookieSecure = false
-  c.CookieHTTPOnly = true
-  c.SessionTTL = 30 * time.Minute
- })
- defer cleanup()
+  api, cleanup := newTestAPI(t, func(c *Config) {
+    c.CookieSecure = false
+    httpOnly := true
+    c.CookieHTTPOnly = &httpOnly
+    c.SessionTTL = 30 * time.Minute
+  })
+  defer cleanup()
 
  // Register and login
  if _, err := api.Register(httptest.NewRequest("GET", "/", nil).Context(), "c@example.com", "password123"); err != nil {

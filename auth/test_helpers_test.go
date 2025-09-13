@@ -9,22 +9,23 @@ import (
 )
 
 func newTestAPI(t *testing.T, mutate ...func(*Config)) (*API, func()) {
- t.Helper()
- dir := t.TempDir()
- dbPath := filepath.Join(dir, "test.db")
+  t.Helper()
+  dir := t.TempDir()
+  dbPath := filepath.Join(dir, "test.db")
+  base := time.Unix(1_700_000_000, 0)
+  httpOnly := true
 
- base := time.Unix(1_700_000_000, 0)
- cfg := Config{
-  DBPath:         dbPath,
-  SessionName:    "session",
-  SessionTTL:     time.Hour,
-  CookieHTTPOnly: true,
-  CookieSecure:   false,
-  BcryptCost:     4, // Fast for tests
-  Now: func() time.Time {
-   return base
-  },
- }
+  cfg := Config{
+    DBPath:         dbPath,
+    SessionName:    "session",
+    SessionTTL:     time.Hour,
+    CookieHTTPOnly: &httpOnly,
+    CookieSecure:   false,
+    BcryptCost:     4, // Fast for tests
+    Now: func() time.Time {
+      return base
+    },
+  }
 
  for _, fn := range mutate {
   fn(&cfg)
